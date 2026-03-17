@@ -5,6 +5,12 @@ Text is extracted at upload time using PyMuPDF (native text).
 Scanned/image-only pages are OCR'd in parallel via Tesseract.
 Background processing with real-time progress tracking.
 Searches are instant via cached JSON.
+
+Topic Analysis & Semantic Search (v2):
+- Detects chapters/sections via font-size analysis (PyMuPDF)
+- Falls back to TF-IDF keyword clustering for topic detection
+- Generates sentence embeddings (all-MiniLM-L6-v2) for semantic search
+- When exact keyword search fails, returns related topics via cosine similarity
 """
 
 from flask import (
@@ -24,6 +30,23 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 import io
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
+
+# Lazy-load the sentence-transformer model (downloads ~90MB on first run)
+_st_model = None
+_st_lock = threading.Lock()
+
+def get_st_model():
+    """Lazy-load and cache the sentence-transformer model."""
+    global _st_model
+    if _st_model is None:
+        with _st_lock:
+            if _st_model is None:
+                from sentence_transformers import SentenceTransformer
+                _st_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _st_model
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
@@ -31,12 +54,15 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload limit
 
 UPLOAD_FOLDER = "uploads"
 CACHE_FOLDER = "cache"
+EMBEDDINGS_FOLDER = "embeddings"
 ALLOWED_EXTENSIONS = {".pdf"}  # FIX #3: removed .png
 SNIPPET_RADIUS = 300
 OCR_DPI = 150
 MAX_RESULT_STORE = 50  # Max server-side result entries before cleanup
+SEMANTIC_THRESHOLD = 0.25  # Minimum cosine similarity for semantic results
+MAX_SEMANTIC_RESULTS = 8  # Max semantic matches to return
 
-for folder in (UPLOAD_FOLDER, CACHE_FOLDER):
+for folder in (UPLOAD_FOLDER, CACHE_FOLDER, EMBEDDINGS_FOLDER):
     os.makedirs(folder, exist_ok=True)
 
 # ── Tesseract Configuration ──────────────────────────────────
@@ -51,6 +77,7 @@ if os.name == "nt":
 ocr_tasks = {}          # task_id → {status, done, total, ...}
 ocr_cancel_flags = {}   # task_id → bool
 result_store = {}       # result_id → {results, keyword}
+analysis_tasks = {}     # task_id → {status, filename, topics, ...}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -58,17 +85,13 @@ result_store = {}       # result_id → {results, keyword}
 # ──────────────────────────────────────────────────────────────
 
 def clear_all_files():
-    """Remove all uploaded PDFs and cached JSON files."""
-    for f in os.listdir(UPLOAD_FOLDER):
-        try:
-            os.remove(os.path.join(UPLOAD_FOLDER, f))
-        except Exception:
-            pass
-    for f in os.listdir(CACHE_FOLDER):
-        try:
-            os.remove(os.path.join(CACHE_FOLDER, f))
-        except Exception:
-            pass
+    """Remove all uploaded PDFs, cached JSON, and embedding files."""
+    for folder in (UPLOAD_FOLDER, CACHE_FOLDER, EMBEDDINGS_FOLDER):
+        for f in os.listdir(folder):
+            try:
+                os.remove(os.path.join(folder, f))
+            except Exception:
+                pass
 
 
 def cancel_running_tasks():
@@ -105,6 +128,307 @@ def store_results(results, keyword):
     result_id = str(uuid.uuid4())
     result_store[result_id] = {"results": results, "keyword": keyword}
     return result_id
+
+
+# ──────────────────────────────────────────────────────────────
+# TOPIC DETECTION & SEMANTIC SEARCH
+# ──────────────────────────────────────────────────────────────
+
+def detect_topics(filepath: str, cached_pages: list):
+    """
+    Detect topics/sections from a PDF using two strategies:
+    1. Font-size analysis: larger fonts → headings → topic names
+    2. TF-IDF fallback: extract top keywords per page group as topics
+    Returns list of {title, page, summary, text_chunk}.
+    """
+    topics = []
+
+    # Strategy 1: Heading detection via font size
+    try:
+        with fitz.open(filepath) as doc:
+            # Collect all font sizes to determine the body-text baseline
+            all_sizes = []
+            for i in range(min(len(doc), 30)):  # Sample first 30 pages
+                blocks = doc.load_page(i).get_text("dict", flags=0)["blocks"]
+                for b in blocks:
+                    for line in b.get("lines", []):
+                        for span in line.get("spans", []):
+                            sz = round(span["size"], 1)
+                            txt = span["text"].strip()
+                            if txt and len(txt) > 1:
+                                all_sizes.append(sz)
+
+            if all_sizes:
+                # Body text is usually the most common font size
+                from collections import Counter
+                size_counts = Counter(all_sizes)
+                body_size = size_counts.most_common(1)[0][0]
+                heading_threshold = body_size + 1.5  # Headings are bigger
+
+                for i in range(len(doc)):
+                    page = doc.load_page(i)
+                    blocks = page.get_text("dict", flags=0)["blocks"]
+                    for b in blocks:
+                        for line in b.get("lines", []):
+                            for span in line.get("spans", []):
+                                sz = round(span["size"], 1)
+                                txt = span["text"].strip()
+                                is_bold = "bold" in span.get("font", "").lower()
+                                if txt and len(txt) > 3 and len(txt) < 150:
+                                    if sz >= heading_threshold or (
+                                        sz >= body_size + 0.5 and is_bold
+                                    ):
+                                        topics.append({
+                                            "title": txt,
+                                            "page": i + 1,
+                                            "font_size": sz,
+                                        })
+    except Exception:
+        pass
+
+    # Deduplicate and clean topics
+    seen_titles = set()
+    clean_topics = []
+    for t in topics:
+        normalized = t["title"].lower().strip()
+        # Skip page numbers, very short titles, or duplicates
+        if (
+            normalized not in seen_titles
+            and len(normalized) > 3
+            and not normalized.replace(".", "").replace(" ", "").isdigit()
+        ):
+            seen_titles.add(normalized)
+            clean_topics.append(t)
+
+    # Strategy 2: TF-IDF fallback if few headings found
+    if len(clean_topics) < 3 and len(cached_pages) > 2:
+        try:
+            # Group pages into chunks of 5
+            chunks = []
+            chunk_pages = []
+            for i in range(0, len(cached_pages), 5):
+                group = cached_pages[i : i + 5]
+                combined = " ".join(p["text"] for p in group)
+                chunks.append(combined)
+                chunk_pages.append(group[0]["page"])
+
+            if chunks:
+                vectorizer = TfidfVectorizer(
+                    max_features=100, stop_words="english",
+                    min_df=1, max_df=0.9
+                )
+                tfidf = vectorizer.fit_transform(chunks)
+                feature_names = vectorizer.get_feature_names_out()
+
+                for idx, row in enumerate(tfidf.toarray()):
+                    top_indices = row.argsort()[-3:][::-1]
+                    top_words = [feature_names[j] for j in top_indices if row[j] > 0]
+                    if top_words:
+                        title = " / ".join(w.title() for w in top_words)
+                        normalized = title.lower()
+                        if normalized not in seen_titles:
+                            seen_titles.add(normalized)
+                            clean_topics.append({
+                                "title": f"Section: {title}",
+                                "page": chunk_pages[idx],
+                                "font_size": 0,
+                            })
+        except Exception:
+            pass
+
+    # Enrich topics with summaries from the page text
+    for topic in clean_topics:
+        page_num = topic["page"]
+        # Find the page text
+        page_text = ""
+        for p in cached_pages:
+            if p["page"] == page_num:
+                page_text = p["text"]
+                break
+
+        # Extract first 2-3 sentences as summary
+        if page_text:
+            sentences = re.split(r'(?<=[.!?])\s+', page_text.strip())
+            summary_sentences = [s for s in sentences[:5] if len(s) > 20][:3]
+            topic["summary"] = " ".join(summary_sentences)[:400]
+            # Store a text chunk for embedding
+            topic["text_chunk"] = page_text[:1000]
+        else:
+            topic["summary"] = ""
+            topic["text_chunk"] = topic["title"]
+
+    # Sort by page number
+    clean_topics.sort(key=lambda x: x["page"])
+    return clean_topics
+
+
+def generate_embeddings(filename: str, cached_pages: list, topics: list):
+    """
+    Generate embeddings for all pages and topics using sentence-transformers.
+    Saves to embeddings/<filename>.npz
+    """
+    model = get_st_model()
+
+    # Create text chunks for each page
+    page_texts = []
+    page_nums = []
+    for p in cached_pages:
+        text = p["text"][:1500]  # Limit chunk size
+        if text.strip():
+            page_texts.append(text)
+            page_nums.append(p["page"])
+
+    # Create text chunks for each topic
+    topic_texts = [t.get("text_chunk", t["title"]) for t in topics]
+
+    # Encode everything
+    all_texts = page_texts + topic_texts
+    if not all_texts:
+        return
+
+    embeddings = model.encode(all_texts, show_progress_bar=False)
+
+    page_embeddings = embeddings[: len(page_texts)]
+    topic_embeddings = embeddings[len(page_texts) :]
+
+    # Save to disk
+    emb_path = os.path.join(EMBEDDINGS_FOLDER, f"{filename}.npz")
+    np.savez(
+        emb_path,
+        page_embeddings=page_embeddings,
+        page_nums=np.array(page_nums),
+        topic_embeddings=topic_embeddings,
+    )
+
+
+def run_analysis_background(filepath, filename, task_id):
+    """Background worker: detect topics + generate embeddings."""
+    try:
+        analysis_tasks[task_id]["status"] = "running"
+
+        # Wait for cache file to be ready
+        cache_path = os.path.join(CACHE_FOLDER, f"{filename}.json")
+        for _ in range(120):  # Wait up to 2 minutes
+            if os.path.exists(cache_path):
+                break
+            import time
+            time.sleep(1)
+
+        if not os.path.exists(cache_path):
+            analysis_tasks[task_id]["status"] = "error"
+            analysis_tasks[task_id]["error"] = "Cache file not ready"
+            return
+
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        cached_pages = data.get("pages", [])
+
+        # Step 1: Detect topics
+        analysis_tasks[task_id]["step"] = "Detecting topics..."
+        topics = detect_topics(filepath, cached_pages)
+        analysis_tasks[task_id]["topics"] = topics
+
+        # Step 2: Generate embeddings
+        analysis_tasks[task_id]["step"] = "Generating embeddings..."
+        generate_embeddings(filename, cached_pages, topics)
+
+        # Save topics to a JSON file
+        topics_path = os.path.join(CACHE_FOLDER, f"{filename}.topics.json")
+        # Clean topics for JSON serialization (remove text_chunk)
+        saveable = [
+            {"title": t["title"], "page": t["page"], "summary": t["summary"]}
+            for t in topics
+        ]
+        with open(topics_path, "w", encoding="utf-8") as f:
+            json.dump(saveable, f, ensure_ascii=False)
+
+        analysis_tasks[task_id]["status"] = "done"
+        analysis_tasks[task_id]["topic_count"] = len(topics)
+
+    except Exception as e:
+        analysis_tasks[task_id]["status"] = "error"
+        analysis_tasks[task_id]["error"] = str(e)
+
+
+def semantic_search(keyword: str, filename: str):
+    """
+    Perform semantic search using cosine similarity against stored embeddings.
+    Returns list of {filename, page, text, score, topic_title, summary}.
+    """
+    emb_path = os.path.join(EMBEDDINGS_FOLDER, f"{filename}.npz")
+    if not os.path.exists(emb_path):
+        return []
+
+    cache_path = os.path.join(CACHE_FOLDER, f"{filename}.json")
+    topics_path = os.path.join(CACHE_FOLDER, f"{filename}.topics.json")
+
+    if not os.path.exists(cache_path):
+        return []
+
+    try:
+        model = get_st_model()
+        query_embedding = model.encode([keyword])
+
+        data = np.load(emb_path)
+        page_embeddings = data["page_embeddings"]
+        page_nums = data["page_nums"]
+
+        # Cosine similarity against all page embeddings
+        similarities = sklearn_cosine(query_embedding, page_embeddings)[0]
+
+        # Load page texts
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+
+        # Load topics
+        topics = []
+        if os.path.exists(topics_path):
+            with open(topics_path, "r", encoding="utf-8") as f:
+                topics = json.load(f)
+
+        # Find pages with similarity above threshold
+        results = []
+        scored = list(zip(page_nums, similarities))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        for page_num, score in scored[:MAX_SEMANTIC_RESULTS]:
+            if score < SEMANTIC_THRESHOLD:
+                break
+
+            # Find the page text
+            page_text = ""
+            for p in cache_data.get("pages", []):
+                if p["page"] == int(page_num):
+                    page_text = p["text"]
+                    break
+
+            # Find the topic for this page
+            topic_title = ""
+            topic_summary = ""
+            for t in topics:
+                if t["page"] <= int(page_num):
+                    topic_title = t["title"]
+                    topic_summary = t.get("summary", "")
+
+            # Build a snippet (first 400 chars of page text)
+            snippet = page_text[:400].replace("\n", " ").strip()
+            if len(page_text) > 400:
+                snippet += "..."
+
+            results.append({
+                "filename": cache_data.get("filename", filename),
+                "page": int(page_num),
+                "text": snippet,
+                "score": round(float(score), 3),
+                "topic_title": topic_title,
+                "topic_summary": topic_summary,
+            })
+
+        return results
+
+    except Exception:
+        return []
 
 
 # ──────────────────────────────────────────────────────────────
@@ -330,9 +654,11 @@ def index():
     stored = result_store.pop(result_id, {}) if result_id else {}
     results = stored.get("results")
     keyword = stored.get("keyword")
+    semantic_results = stored.get("semantic_results")
 
     uploaded_file = session.pop("uploaded_file", None)
     active_task_id = session.pop("active_task_id", None)
+    analysis_task_id = session.pop("analysis_task_id", None)
 
     # If no uploaded_file in session, check disk for existing files
     if uploaded_file:
@@ -347,7 +673,7 @@ def index():
     cached_files = [
         f.replace(".json", "")
         for f in os.listdir(CACHE_FOLDER)
-        if f.endswith(".json")
+        if f.endswith(".json") and not f.endswith(".topics.json")
     ]
 
     # Recover active OCR task on page refresh (session was popped)
@@ -355,6 +681,13 @@ def index():
         for tid, task in ocr_tasks.items():
             if task.get("status") == "running":
                 active_task_id = tid
+                break
+
+    # Recover active analysis task on page refresh
+    if not analysis_task_id:
+        for tid, task in analysis_tasks.items():
+            if task.get("status") == "running":
+                analysis_task_id = tid
                 break
 
     response = make_response(
@@ -365,6 +698,8 @@ def index():
             results=results,
             keyword=keyword,
             active_task_id=active_task_id,
+            analysis_task_id=analysis_task_id,
+            semantic_results=semantic_results,
         )
     )
     return no_cache_response(response)
@@ -443,6 +778,24 @@ def upload():
             )
             session["uploaded_file"] = filename
 
+        # Start AI topic analysis in the background
+        analysis_id = str(uuid.uuid4())
+        analysis_tasks[analysis_id] = {
+            "status": "pending",
+            "filename": filename,
+            "step": "Queued...",
+            "topics": [],
+            "topic_count": 0,
+            "error": None,
+        }
+        analysis_thread = threading.Thread(
+            target=run_analysis_background,
+            args=(filepath, filename, analysis_id),
+            daemon=True,
+        )
+        analysis_thread.start()
+        session["analysis_task_id"] = analysis_id
+
     except Exception as e:
         flash(f"Upload OK but processing failed: {e}", "danger")
 
@@ -467,9 +820,10 @@ def progress(task_id):
 
 @app.route("/search", methods=["POST"])
 def search():
-    """Search cached JSON files for keyword matches."""
+    """Search cached JSON files for keyword matches, with semantic fallback."""
     keyword = request.form.get("keyword", "").strip()
     results = []
+    semantic_results = []
 
     if not keyword:
         flash("Please enter a keyword to search.", "warning")
@@ -485,7 +839,8 @@ def search():
     keyword_lower = keyword.lower()
 
     cache_files = [
-        f for f in os.listdir(CACHE_FOLDER) if f.endswith(".json")
+        f for f in os.listdir(CACHE_FOLDER)
+        if f.endswith(".json") and not f.endswith(".topics.json")
     ]
     if not cache_files:
         flash(
@@ -514,17 +869,58 @@ def search():
                     }
                 )
 
-    if not results:
+    # Semantic search fallback when no exact matches found
+    if not results and current_uploaded:
+        try:
+            semantic_results = semantic_search(keyword, current_uploaded)
+            if semantic_results:
+                flash(
+                    f"No exact match for '{keyword}', but found "
+                    f"{len(semantic_results)} related topic(s) using AI analysis.",
+                    "info",
+                )
+            else:
+                flash(f"No results found for '{keyword}'.", "info")
+        except Exception:
+            flash(f"No results found for '{keyword}'.", "info")
+    elif not results:
         flash(f"No results found for '{keyword}'.", "info")
 
-    # FIX #1: Store results server-side (avoids ~4KB session cookie limit)
+    # Store results server-side (avoids ~4KB session cookie limit)
     result_id = store_results(results, keyword)
+    result_store[result_id]["semantic_results"] = semantic_results
     session["result_id"] = result_id
 
     if current_uploaded:
         session["uploaded_file"] = current_uploaded
 
     return redirect(url_for("index"))
+
+
+@app.route("/analysis-progress/<task_id>")
+def analysis_progress(task_id):
+    """Return analysis progress as JSON for the frontend."""
+    task = analysis_tasks.get(task_id)
+    if not task:
+        return jsonify({"status": "not_found"})
+    return jsonify({
+        "status": task["status"],
+        "step": task.get("step", ""),
+        "topic_count": task.get("topic_count", 0),
+        "error": task.get("error"),
+    })
+
+
+@app.route("/topics/<filename>")
+def get_topics(filename):
+    """Return detected topics for a given PDF as JSON."""
+    safe_filename = secure_filename(filename)
+    topics_path = os.path.join(CACHE_FOLDER, f"{safe_filename}.topics.json")
+    if not os.path.exists(topics_path):
+        return jsonify({"topics": [], "status": "not_found"})
+    with open(topics_path, "r", encoding="utf-8") as f:
+        topics = json.load(f)
+    return jsonify({"topics": topics, "status": "ok"})
 
 
 @app.route("/clear", methods=["POST"])
@@ -535,6 +931,7 @@ def clear():
     ocr_tasks.clear()
     ocr_cancel_flags.clear()
     result_store.clear()
+    analysis_tasks.clear()
     session.clear()
     flash("All files cleared.", "info")
     return redirect(url_for("index"))
