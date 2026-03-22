@@ -166,7 +166,7 @@ flowchart TD
     User([User]) -->|Uploads PDF| FlaskApp(Flask App)
     FlaskApp -->|Checks pages| PyMuPDF{PyMuPDF Native Text?}
     PyMuPDF -->|Yes| CacheJSON[(Cache JSON)]
-    PyMuPDF -->|No (Scanned)| OCRWorker[OCR Worker Thread]
+    PyMuPDF -->|"No (Scanned)"| OCRWorker[OCR Worker Thread]
     OCRWorker -->|Extracts Text| CacheJSON
     
     CacheJSON --> AIWorker[AI Analysis Worker]
@@ -297,9 +297,9 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     Start(User Uploads File) --> ValidExt{Is .pdf?}
-    ValidExt -- No --> UIError(Flash Error: Invalid File)
-    ValidExt -- Yes --> ValidSize{< 50MB?}
-    ValidSize -- No --> UILarge(Flash Error: Too Large)
+    ValidExt -- No --> UIError("Flash Error: Invalid File")
+    ValidExt -- Yes --> ValidSize{"< 50MB?"}
+    ValidSize -- No --> UILarge("Flash Error: Too Large")
     ValidSize -- Yes --> Cancel[Cancel running OCR/AI tasks]
     Cancel --> CleanCache[Clear previous uploads/cache]
     CleanCache --> Save[Save to /uploads]
@@ -310,9 +310,9 @@ flowchart TD
 ```mermaid
 flowchart TD
     Start[AI Worker Starts] --> LoadJSON[Load Cached JSON Text]
-    LoadJSON --> Strategy1[Strategy 1: Font Size Analysis via PyMuPDF]
-    Strategy1 --> Found{Found > 2 Headings?}
-    Found -- Yes --> Format1[Format Headings & Summarize]
+    LoadJSON --> Strategy1["Strategy 1: Font Size Analysis via PyMuPDF"]
+    Strategy1 --> Found{"Found > 2 Headings?"}
+    Found -- Yes --> Format1["Format Headings & Summarize"]
     Found -- No --> Strategy2[Strategy 2: TF-IDF Fallback]
     Strategy2 --> ChunkPages[Group pages into chunks of 5]
     ChunkPages --> TFIDF[Run TF-IDF Vectorizer]
@@ -330,9 +330,9 @@ flowchart TD
     CheckNPZ -- Yes --> TransformQuery[Model encodes keyword into vector]
     TransformQuery --> LoadNPZ[Load page embeddings]
     LoadNPZ --> CosineSim[Compute Scikit-learn Cosine Similarity]
-    CosineSim --> Threshold{Score >= 0.25?}
+    CosineSim --> Threshold{"Score >= 0.25?"}
     Threshold -- No --> ExactMatch
-    Threshold -- Yes --> TopK[Sort by highest score, take Top 8]
+    Threshold -- Yes --> TopK["Sort by highest score, take Top 8"]
     TopK --> JoinText[Fetch page text & topic summaries]
     JoinText --> Highlight[Generate context snippet]
     Highlight --> Return(Return Semantic Results to UI)
