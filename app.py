@@ -78,6 +78,7 @@ ocr_tasks = {}          # task_id → {status, done, total, ...}
 ocr_cancel_flags = {}   # task_id → bool
 result_store = {}       # result_id → {results, keyword}
 analysis_tasks = {}     # task_id → {status, filename, topics, ...}
+analysis_cancel_flags = {} # task_id → bool
 
 
 # ──────────────────────────────────────────────────────────────
@@ -95,10 +96,14 @@ def clear_all_files():
 
 
 def cancel_running_tasks():
-    """Signal all running OCR tasks to stop gracefully."""
+    """Signal all running tasks to stop gracefully."""
     for tid in list(ocr_tasks.keys()):
         if ocr_tasks[tid].get("status") == "running":
             ocr_cancel_flags[tid] = True
+            
+    for tid in list(analysis_tasks.keys()):
+        if analysis_tasks[tid].get("status") in ["running", "pending"]:
+            analysis_cancel_flags[tid] = True
 
 
 def allowed_file(filename):
@@ -304,19 +309,34 @@ def generate_embeddings(filename: str, cached_pages: list, topics: list):
 def run_analysis_background(filepath, filename, task_id):
     """Background worker: detect topics + generate embeddings."""
     try:
+        if analysis_cancel_flags.get(task_id):
+            if task_id in analysis_tasks:
+                analysis_tasks[task_id]["status"] = "cancelled"
+            return
+
         analysis_tasks[task_id]["status"] = "running"
 
         # Wait for cache file to be ready
         cache_path = os.path.join(CACHE_FOLDER, f"{filename}.json")
-        for _ in range(120):  # Wait up to 2 minutes
+        for _ in range(3600):  # Wait up to 60 minutes
+            if analysis_cancel_flags.get(task_id):
+                if task_id in analysis_tasks:
+                    analysis_tasks[task_id]["status"] = "cancelled"
+                return
             if os.path.exists(cache_path):
                 break
             import time
             time.sleep(1)
 
         if not os.path.exists(cache_path):
-            analysis_tasks[task_id]["status"] = "error"
-            analysis_tasks[task_id]["error"] = "Cache file not ready"
+            if task_id in analysis_tasks:
+                analysis_tasks[task_id]["status"] = "error"
+                analysis_tasks[task_id]["error"] = "Cache file not ready"
+            return
+            
+        if analysis_cancel_flags.get(task_id):
+            if task_id in analysis_tasks:
+                analysis_tasks[task_id]["status"] = "cancelled"
             return
 
         with open(cache_path, "r", encoding="utf-8") as f:
@@ -330,7 +350,14 @@ def run_analysis_background(filepath, filename, task_id):
         analysis_tasks[task_id]["topics"] = topics
 
         # Step 2: Generate embeddings
-        analysis_tasks[task_id]["step"] = "Generating embeddings..."
+        if task_id in analysis_tasks:
+            analysis_tasks[task_id]["step"] = "Generating embeddings..."
+            
+        if analysis_cancel_flags.get(task_id):
+            if task_id in analysis_tasks:
+                analysis_tasks[task_id]["status"] = "cancelled"
+            return
+            
         generate_embeddings(filename, cached_pages, topics)
 
         # Save topics to a JSON file
@@ -340,15 +367,25 @@ def run_analysis_background(filepath, filename, task_id):
             {"title": t["title"], "page": t["page"], "summary": t["summary"]}
             for t in topics
         ]
+        
+        if analysis_cancel_flags.get(task_id):
+            if task_id in analysis_tasks:
+                analysis_tasks[task_id]["status"] = "cancelled"
+            return
+            
         with open(topics_path, "w", encoding="utf-8") as f:
             json.dump(saveable, f, ensure_ascii=False)
 
-        analysis_tasks[task_id]["status"] = "done"
-        analysis_tasks[task_id]["topic_count"] = len(topics)
+        if task_id in analysis_tasks:
+            analysis_tasks[task_id]["status"] = "done"
+            analysis_tasks[task_id]["topic_count"] = len(topics)
 
     except Exception as e:
-        analysis_tasks[task_id]["status"] = "error"
-        analysis_tasks[task_id]["error"] = str(e)
+        if task_id in analysis_tasks:
+            analysis_tasks[task_id]["status"] = "error"
+            analysis_tasks[task_id]["error"] = str(e)
+        else:
+            analysis_tasks[task_id] = {"status": "error", "error": str(e)}
 
 
 def semantic_search(keyword: str, filename: str):
@@ -650,15 +687,15 @@ def index():
     FIX #5: No longer auto-clears files on every visit.
     """
     # Retrieve server-side results (if any)
-    result_id = session.pop("result_id", None)
-    stored = result_store.pop(result_id, {}) if result_id else {}
+    result_id = session.get("result_id", None)
+    stored = result_store.get(result_id, {}) if result_id else {}
     results = stored.get("results")
     keyword = stored.get("keyword")
     semantic_results = stored.get("semantic_results")
 
-    uploaded_file = session.pop("uploaded_file", None)
-    active_task_id = session.pop("active_task_id", None)
-    analysis_task_id = session.pop("analysis_task_id", None)
+    uploaded_file = session.get("uploaded_file", None)
+    active_task_id = session.get("active_task_id", None)
+    analysis_task_id = session.get("analysis_task_id", None)
 
     # If no uploaded_file in session, check disk for existing files
     if uploaded_file:
@@ -675,20 +712,6 @@ def index():
         for f in os.listdir(CACHE_FOLDER)
         if f.endswith(".json") and not f.endswith(".topics.json")
     ]
-
-    # Recover active OCR task on page refresh (session was popped)
-    if not active_task_id:
-        for tid, task in ocr_tasks.items():
-            if task.get("status") == "running":
-                active_task_id = tid
-                break
-
-    # Recover active analysis task on page refresh
-    if not analysis_task_id:
-        for tid, task in analysis_tasks.items():
-            if task.get("status") == "running":
-                analysis_task_id = tid
-                break
 
     response = make_response(
         render_template(
@@ -788,6 +811,7 @@ def upload():
             "topic_count": 0,
             "error": None,
         }
+        analysis_cancel_flags[analysis_id] = False
         analysis_thread = threading.Thread(
             target=run_analysis_background,
             args=(filepath, filename, analysis_id),
@@ -932,6 +956,7 @@ def clear():
     ocr_cancel_flags.clear()
     result_store.clear()
     analysis_tasks.clear()
+    analysis_cancel_flags.clear()
     session.clear()
     flash("All files cleared.", "info")
     return redirect(url_for("index"))
