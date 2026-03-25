@@ -24,6 +24,7 @@ import os
 import re
 import json
 import uuid
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
@@ -772,6 +773,7 @@ def upload():
                 "total_pages": 0,
                 "filename": filename,
                 "error": None,
+                "start_time": time.time(),
             }
             ocr_cancel_flags[task_id] = False
 
@@ -832,12 +834,14 @@ def progress(task_id):
     task = ocr_tasks.get(task_id)
     if not task:
         return jsonify({"status": "not_found"})
+    elapsed = time.time() - task.get("start_time", time.time())
     return jsonify(
         {
             "status": task["status"],
             "done": task["done"],
             "total": task["total"],
             "error": task.get("error"),
+            "elapsed": round(elapsed, 1),
         }
     )
 

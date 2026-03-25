@@ -1810,7 +1810,16 @@
         })();
 
         var pollInterval = null;
-        var pollStartTime = null;
+
+        function formatEta(seconds) {
+            if (seconds < 0 || !isFinite(seconds)) return 'Calculating\u2026';
+            seconds = Math.round(seconds);
+            if (seconds < 60) return '~' + seconds + 's left';
+            if (seconds < 3600) return '~' + Math.round(seconds / 60) + ' min left';
+            var h = Math.floor(seconds / 3600);
+            var m = Math.round((seconds % 3600) / 60);
+            return '~' + h + 'h ' + m + 'm left';
+        }
 
         function startProgressPolling(taskId) {
             var section = document.getElementById('ocrProgress');
@@ -1823,7 +1832,6 @@
             var doneBox = document.getElementById('progressDone');
 
             section.classList.add('active');
-            pollStartTime = Date.now();
 
             pollInterval = setInterval(function () {
                 fetch('/progress/' + taskId)
@@ -1841,8 +1849,8 @@
                             label.textContent = 'Processing cancelled.';
                             fill.style.animation = 'none';
                             fill.style.background = 'var(--text-muted)';
-                            speed.textContent = '—';
-                            eta.textContent = '—';
+                            speed.textContent = '\u2014';
+                            eta.textContent = '\u2014';
                             return;
                         }
 
@@ -1854,19 +1862,18 @@
                         percent.textContent = pct + '%';
                         pages.textContent = data.done + ' / ' + data.total + ' pages';
 
-                        // Speed & ETA calculation
-                        var elapsed = (Date.now() - pollStartTime) / 1000;
+                        // Speed & ETA — use server-provided elapsed time
+                        var elapsed = data.elapsed || 0;
                         if (elapsed > 2 && data.done > 0) {
-                            var pps = (data.done / elapsed).toFixed(1);
-                            speed.textContent = pps + ' pages/sec';
+                            var pps = data.done / elapsed;
+                            speed.textContent = pps.toFixed(1) + ' pages/sec';
 
                             var remaining = data.total - data.done;
-                            var etaSec = Math.round(remaining / (data.done / elapsed));
-                            if (etaSec > 60) {
-                                eta.textContent = '~' + Math.round(etaSec / 60) + ' min left';
-                            } else {
-                                eta.textContent = '~' + etaSec + 's left';
-                            }
+                            var etaSec = remaining / pps;
+                            eta.textContent = formatEta(etaSec);
+                        } else if (data.done === 0) {
+                            speed.textContent = 'Starting\u2026';
+                            eta.textContent = 'Estimating\u2026';
                         }
 
                         if (data.status === 'done') {
@@ -1875,7 +1882,8 @@
                             percent.textContent = '100%';
                             label.textContent = 'Processing complete!';
                             pages.textContent = data.total + ' / ' + data.total + ' pages';
-                            speed.textContent = 'Done';
+                            var totalTime = elapsed > 0 ? elapsed.toFixed(1) + 's' : '';
+                            speed.textContent = totalTime ? 'Done in ' + totalTime : 'Done';
                             eta.textContent = 'Complete';
                             doneBox.classList.add('active');
 
